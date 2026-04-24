@@ -1,0 +1,7 @@
+.DS_Store
+.qtcreator/
+
+build/
+
+3rdparty/ffmpeg/_build/
+3rdparty/ffmpeg/_src/

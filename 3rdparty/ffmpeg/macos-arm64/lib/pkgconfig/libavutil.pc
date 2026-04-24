@@ -1,0 +1,14 @@
+prefix=/Users/hanpengye/Documents/Qt-projects/OpenGLAndFFmpeg/3rdparty/ffmpeg/macos-arm64
+exec_prefix=${prefix}
+libdir=/Users/hanpengye/Documents/Qt-projects/OpenGLAndFFmpeg/3rdparty/ffmpeg/macos-arm64/lib
+includedir=/Users/hanpengye/Documents/Qt-projects/OpenGLAndFFmpeg/3rdparty/ffmpeg/macos-arm64/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 60.26.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -lm -lz -framework VideoToolbox -pthread -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework CoreServices
+Cflags: -I${includedir}
