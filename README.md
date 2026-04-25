@@ -149,9 +149,3 @@ cmake --build build/Release
 - 更完整的音视频同步策略
 - OpenGL 渲染优化
 - macOS `.app` 打包与分发
-
-## 说明
-
-- 当前项目以学习和工程实践为主
-- 当前验证重点放在 macOS 平台
-- 如果后续需要支持 Windows，可以再单独补充 Windows 对应的私有 FFmpeg 目录和构建脚本
