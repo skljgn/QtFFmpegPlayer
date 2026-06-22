@@ -8,6 +8,8 @@
 #include <QMetaObject>
 #include <QMutexLocker>
 
+#include <cmath>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -54,6 +56,15 @@ int calculateFrameDelayMs(const AVStream *stream, const AVFrame *frame, double &
     return qMax(1, static_cast<int>(delaySeconds * 1000.0));
 }
 
+qint64 streamTimestampToMs(const AVStream *stream, int64_t timestamp)
+{
+    if (stream == nullptr || timestamp == AV_NOPTS_VALUE) {
+        return -1;
+    }
+
+    return static_cast<qint64>(timestamp * av_q2d(stream->time_base) * 1000.0);
+}
+
 AVSampleFormat toAvSampleFormat(QAudioFormat::SampleFormat sampleFormat)
 {
     switch (sampleFormat) {
@@ -76,6 +87,33 @@ AVSampleFormat toAvSampleFormat(QAudioFormat::SampleFormat sampleFormat)
 QString formatPlaybackName(const QString &prefix, const QString &filePath)
 {
     return QObject::tr("%1: %2").arg(prefix, QFileInfo(filePath).fileName());
+}
+
+QString formatPositionText(qint64 positionMs)
+{
+    const qint64 totalSeconds = qMax<qint64>(0, positionMs) / 1000;
+    const qint64 hours = totalSeconds / 3600;
+    const qint64 minutes = (totalSeconds % 3600) / 60;
+    const qint64 seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+        return QStringLiteral("%1:%2:%3")
+            .arg(hours, 2, 10, QLatin1Char('0'))
+            .arg(minutes, 2, 10, QLatin1Char('0'))
+            .arg(seconds, 2, 10, QLatin1Char('0'));
+    }
+
+    return QStringLiteral("%1:%2")
+        .arg(minutes, 2, 10, QLatin1Char('0'))
+        .arg(seconds, 2, 10, QLatin1Char('0'));
+}
+
+QString formatSeekStatus(const QString &filePath, qint64 positionMs, bool isPaused)
+{
+    return QObject::tr("已跳转到 %1（%2）: %3")
+        .arg(formatPositionText(positionMs),
+             isPaused ? QObject::tr("已暂停") : QObject::tr("正在播放"),
+             QFileInfo(filePath).fileName());
 }
 
 } // namespace
@@ -149,6 +187,18 @@ bool FfmpegPlayer::isDecodingActive() const
     return isRunning();
 }
 
+void FfmpegPlayer::seekTo(qint64 positionMs)
+{
+    QMutexLocker locker(&m_mutex);
+    if (!isRunning()) {
+        return;
+    }
+
+    m_seekRequested = true;
+    m_seekPositionMs = qMax<qint64>(0, positionMs);
+    m_pauseCondition.wakeAll();
+}
+
 void FfmpegPlayer::run()
 {
     QString filePath;
@@ -182,12 +232,13 @@ void FfmpegPlayer::run()
     int rgbWidth = 0;
     int rgbHeight = 0;
     double lastPtsSeconds = -1.0;
-    qint64 firstVideoPtsMs = -1;
-    bool firstVideoFrameEmitted = false;
     AVSampleFormat outputSampleFormat = AV_SAMPLE_FMT_NONE;
     QAudioFormat outputAudioFormat;
     qint64 audioBufferLimitBytes = 0;
     bool audioOutputStarted = false;
+    qint64 playbackBaseMs = 0;
+    bool seekInProgress = false;
+    qint64 pendingSeekTargetMs = -1;
 
     const auto cleanup = [&]() {
         if (audioOutputStarted) {
@@ -265,6 +316,13 @@ void FfmpegPlayer::run()
         fail(tr("读取流信息失败: %1").arg(ffmpegErrorToString(result)));
         return;
     }
+
+    const qint64 durationMs =
+        formatContext->duration > 0 ? formatContext->duration / 1000 : 0;
+    const qint64 mediaStartUs =
+        formatContext->start_time != AV_NOPTS_VALUE ? formatContext->start_time : 0;
+    emit durationChanged(durationMs);
+    emit positionChanged(0);
 
     result = av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &videoCodec, 0);
     if (result < 0) {
@@ -392,10 +450,71 @@ void FfmpegPlayer::run()
     emit statusChanged(formatPlaybackName(tr("正在播放"), filePath));
 
     AVStream *videoStream = formatContext->streams[videoStreamIndex];
+    AVStream *audioStream =
+        audioStreamIndex >= 0 ? formatContext->streams[audioStreamIndex] : nullptr;
+    const qint64 videoStreamStartMs =
+        videoStream->start_time != AV_NOPTS_VALUE
+            ? streamTimestampToMs(videoStream, videoStream->start_time)
+            : 0;
+    const qint64 audioStreamStartMs =
+        audioStream != nullptr && audioStream->start_time != AV_NOPTS_VALUE
+            ? streamTimestampToMs(audioStream, audioStream->start_time)
+            : 0;
 
     while (true) {
         if (!waitIfPausedOrStopped()) {
             break;
+        }
+
+        qint64 requestedSeekPositionMs = -1;
+        bool seekWhilePaused = false;
+        {
+            QMutexLocker locker(&m_mutex);
+            if (m_seekRequested) {
+                m_seekRequested = false;
+                requestedSeekPositionMs = m_seekPositionMs;
+                seekWhilePaused = m_pauseRequested;
+            }
+        }
+
+        if (requestedSeekPositionMs >= 0) {
+            const int64_t targetUs = mediaStartUs + requestedSeekPositionMs * 1000;
+            result = av_seek_frame(formatContext, -1, targetUs, AVSEEK_FLAG_BACKWARD);
+            if (result < 0) {
+                fail(tr("跳转播放位置失败: %1").arg(ffmpegErrorToString(result)));
+                return;
+            }
+
+            avcodec_flush_buffers(videoCodecContext);
+            if (audioCodecContext != nullptr) {
+                avcodec_flush_buffers(audioCodecContext);
+            }
+            av_packet_unref(packet);
+            av_frame_unref(videoFrame);
+            av_frame_unref(audioFrame);
+
+            if (audioOutputStarted) {
+                QString audioRestartError;
+                QMetaObject::invokeMethod(m_audioOutput, [this, &outputAudioFormat, &audioRestartError]() {
+                    m_audioOutput->stopOutput();
+                    audioRestartError = m_audioOutput->startOutput(outputAudioFormat);
+                }, Qt::BlockingQueuedConnection);
+                if (!audioRestartError.isEmpty()) {
+                    fail(audioRestartError);
+                    return;
+                }
+            }
+
+            if (seekWhilePaused && audioOutputStarted) {
+                suspendAudioOutput();
+            }
+
+            playbackBaseMs = requestedSeekPositionMs;
+            lastPtsSeconds = -1.0;
+            seekInProgress = true;
+            pendingSeekTargetMs = requestedSeekPositionMs;
+            emit positionChanged(requestedSeekPositionMs);
+            emit statusChanged(formatSeekStatus(filePath, requestedSeekPositionMs, seekWhilePaused));
         }
 
         result = av_read_frame(formatContext, packet);
@@ -509,22 +628,28 @@ void FfmpegPlayer::run()
                                         rgbFrame->linesize[0],
                                         QImage::Format_RGB888);
                 emit frameReady(frameImage.copy());
-                if (!firstVideoFrameEmitted) {
-                    firstVideoFrameEmitted = true;
-                    emit statusChanged(tr("已解码首帧视频"));
+
+                const qint64 rawFramePtsMs =
+                    streamTimestampToMs(videoStream, videoFrame->best_effort_timestamp);
+                const qint64 framePositionMs =
+                    rawFramePtsMs >= 0 ? qMax<qint64>(0, rawFramePtsMs - videoStreamStartMs) : -1;
+
+                if (seekInProgress && framePositionMs >= 0) {
+                    if (framePositionMs < pendingSeekTargetMs) {
+                        continue;
+                    }
+
+                    seekInProgress = false;
+                }
+
+                if (framePositionMs >= 0) {
+                    emit positionChanged(framePositionMs);
                 }
 
                 if (audioOutputStarted &&
-                    videoFrame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                    const qint64 rawFramePtsMs = static_cast<qint64>(
-                        videoFrame->best_effort_timestamp * av_q2d(videoStream->time_base) * 1000.0);
-                    if (firstVideoPtsMs < 0) {
-                        firstVideoPtsMs = rawFramePtsMs;
-                    }
-
-                    const qint64 relativeFramePtsMs = rawFramePtsMs - firstVideoPtsMs;
-                    const qint64 audioClockMs = processedAudioUsecs() / 1000;
-                    const int waitMs = static_cast<int>(relativeFramePtsMs - audioClockMs);
+                    framePositionMs >= 0) {
+                    const qint64 audioClockMs = playbackBaseMs + processedAudioUsecs() / 1000;
+                    const int waitMs = static_cast<int>(framePositionMs - audioClockMs);
                     if (waitMs > 1) {
                         sleepWithControl(waitMs);
                     }
@@ -604,7 +729,57 @@ void FfmpegPlayer::run()
                     return;
                 }
 
-                if (!writeAudioBuffer(audioBuffer.constData(), convertedSize)) {
+                const qint64 rawAudioPtsMs =
+                    audioFrame->best_effort_timestamp != AV_NOPTS_VALUE
+                        ? static_cast<qint64>(
+                            audioFrame->best_effort_timestamp
+                            * av_q2d(audioStream->time_base)
+                            * 1000.0)
+                        : -1;
+                const qint64 audioFrameStartMs =
+                    rawAudioPtsMs >= 0
+                        ? qMax<qint64>(0, rawAudioPtsMs - audioStreamStartMs)
+                        : -1;
+                const qint64 audioFrameDurationMs =
+                    convertedSamples > 0 && outputAudioFormat.sampleRate() > 0
+                        ? static_cast<qint64>(
+                            std::llround((static_cast<double>(convertedSamples) * 1000.0)
+                                         / outputAudioFormat.sampleRate()))
+                        : 0;
+                const qint64 audioFrameEndMs =
+                    audioFrameStartMs >= 0 ? (audioFrameStartMs + audioFrameDurationMs) : -1;
+
+                int writeOffsetBytes = 0;
+                int writeSizeBytes = convertedSize;
+
+                if (seekInProgress &&
+                    audioFrameStartMs >= 0 &&
+                    audioFrameEndMs >= 0) {
+                    if (audioFrameEndMs <= pendingSeekTargetMs) {
+                        continue;
+                    }
+
+                    if (audioFrameStartMs < pendingSeekTargetMs) {
+                        const qint64 trimDurationMs = pendingSeekTargetMs - audioFrameStartMs;
+                        const int bytesPerFrame = outputAudioFormat.bytesPerFrame();
+                        if (bytesPerFrame > 0) {
+                            const int trimSamples = qMin(
+                                convertedSamples,
+                                static_cast<int>(std::llround(
+                                    (static_cast<double>(trimDurationMs)
+                                     * outputAudioFormat.sampleRate())
+                                    / 1000.0)));
+                            writeOffsetBytes = trimSamples * bytesPerFrame;
+                            writeSizeBytes = qMax(0, convertedSize - writeOffsetBytes);
+                        }
+                    }
+                }
+
+                if (writeSizeBytes <= 0) {
+                    continue;
+                }
+
+                if (!writeAudioBuffer(audioBuffer.constData() + writeOffsetBytes, writeSizeBytes)) {
                     cleanup();
                     emit playbackStateChanged(false);
                     emit statusChanged(tr("已停止"));
@@ -618,12 +793,14 @@ void FfmpegPlayer::run()
 
     cleanup();
     emit playbackStateChanged(false);
+    emit positionChanged(0);
     emit statusChanged(formatPlaybackName(tr("播放完成"), filePath));
 }
 
 bool FfmpegPlayer::waitIfPausedOrStopped()
 {
     bool wasPaused = false;
+    bool remainsPaused = false;
     {
         QMutexLocker locker(&m_mutex);
         if (m_stopRequested) {
@@ -639,13 +816,14 @@ bool FfmpegPlayer::waitIfPausedOrStopped()
     bool shouldContinue = true;
     {
         QMutexLocker locker(&m_mutex);
-        while (!m_stopRequested && m_pauseRequested) {
+        while (!m_stopRequested && m_pauseRequested && !m_seekRequested) {
             m_pauseCondition.wait(&m_mutex);
         }
         shouldContinue = !m_stopRequested;
+        remainsPaused = m_pauseRequested;
     }
 
-    if (wasPaused && shouldContinue) {
+    if (wasPaused && shouldContinue && !remainsPaused) {
         resumeAudioOutput();
     }
 
@@ -658,6 +836,7 @@ void FfmpegPlayer::sleepWithControl(int milliseconds)
     while (remaining > 0) {
         bool wasPaused = false;
         bool shouldContinue = true;
+        bool remainsPaused = false;
         {
             QMutexLocker locker(&m_mutex);
             if (m_stopRequested) {
@@ -673,13 +852,14 @@ void FfmpegPlayer::sleepWithControl(int milliseconds)
 
         {
             QMutexLocker locker(&m_mutex);
-            while (!m_stopRequested && m_pauseRequested) {
+            while (!m_stopRequested && m_pauseRequested && !m_seekRequested) {
                 m_pauseCondition.wait(&m_mutex);
             }
             shouldContinue = !m_stopRequested;
+            remainsPaused = m_pauseRequested;
         }
 
-        if (wasPaused && shouldContinue) {
+        if (wasPaused && shouldContinue && !remainsPaused) {
             resumeAudioOutput();
         }
 

@@ -20,6 +20,7 @@ public:
     void pausePlayback();
     void resumePlayback();
     void stopPlayback();
+    void seekTo(qint64 positionMs);
     bool isDecodingActive() const;
 
 signals:
@@ -27,6 +28,8 @@ signals:
     void playbackStateChanged(bool isPlaying);
     void statusChanged(const QString &message);
     void errorOccurred(const QString &message);
+    void durationChanged(qint64 durationMs);
+    void positionChanged(qint64 positionMs);
 
 protected:
     void run() override;
@@ -43,6 +46,8 @@ private:
     QString m_filePath;
     bool m_pauseRequested = false;
     bool m_stopRequested = false;
+    bool m_seekRequested = false;
+    qint64 m_seekPositionMs = 0;
     AudioOutputController *m_audioOutput = nullptr;
 };
 
